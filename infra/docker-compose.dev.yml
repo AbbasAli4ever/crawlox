@@ -63,8 +63,7 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    # Placeholder until Day 4 wires up Celery. Keeps the service stable in compose.
-    command: ["python", "-c", "import time; print('worker placeholder — Celery wired on Day 4'); time.sleep(1e9)"]
+    command: ["celery", "-A", "app.workers.celery_app", "worker", "--loglevel=info", "--concurrency=4"]
 
   frontend:
     build:

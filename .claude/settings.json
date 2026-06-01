@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(mkdir -p backend/app/core frontend infra/postgres docs/decisions && ls -la)"
+      "Bash(mkdir -p backend/app/core frontend infra/postgres docs/decisions && ls -la)",
+      "Bash(docker compose *)"
     ],
     "additionalDirectories": [
       "/Users/swiftninedev/Desktop/NewProjects/myProjects/crawlox/backend/app"
