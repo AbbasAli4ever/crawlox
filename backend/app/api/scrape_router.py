@@ -9,7 +9,7 @@ from sqlalchemy.future import select
 from app.auth.dependencies import get_current_user
 from app.db.base import get_db
 from app.db.models import Task, User
-from app.workers.tasks import scrape_task
+from app.workers.tasks import ai_scrape_task, analyze_task, scrape_task
 
 router = APIRouter(prefix="/api/scrape", tags=["scrape"])
 
@@ -61,6 +61,7 @@ class TaskStatusResponse(BaseModel):
     started_at: datetime | None
     completed_at: datetime | None
     scraped_data: dict | None = None
+    analysis_result: dict | None = None
 
 
 class TaskListResponse(BaseModel):
@@ -86,10 +87,58 @@ def _task_to_response(task: Task, include_data: bool = False) -> TaskStatusRespo
         started_at=task.started_at,
         completed_at=task.completed_at,
         scraped_data=task.scraped_data if include_data else None,
+        analysis_result=task.analysis_result if include_data else None,
     )
 
 
 # ---------- endpoints ----------
+
+class AIScrapeRequest(BaseModel):
+    url: HttpUrl
+    max_items: int = 500
+    timeout_seconds: int = DEFAULT_TIMEOUT
+
+
+@router.post("/ai", status_code=status.HTTP_202_ACCEPTED, response_model=TaskStatusResponse)
+async def start_ai_scrape(
+    body: AIScrapeRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    AI-powered scrape — no selector config needed. The AI analyzes the page
+    structure, generates a Playwright script, and executes it automatically.
+    """
+    if user.credits_used_this_month >= user.monthly_credits_allocated:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Monthly scrape quota exceeded.",
+        )
+
+    max_items = min(body.max_items, _max_items(user))
+    timeout = min(body.timeout_seconds, DEFAULT_TIMEOUT)
+
+    task = Task(
+        id=uuid.uuid4(),
+        user_id=user.id,
+        url=str(body.url),
+        status="pending",
+        custom_fields={
+            "mode": "ai_scrape",
+            "max_items": max_items,
+            "timeout_seconds": timeout,
+        },
+    )
+    db.add(task)
+    user.credits_used_this_month += 1
+    await db.commit()
+    await db.refresh(task)
+
+    queue = "high" if user.subscription_tier == "premium" else "celery"
+    ai_scrape_task.apply_async(args=[str(task.id)], queue=queue)
+
+    return _task_to_response(task)
+
 
 @router.post("", status_code=status.HTTP_202_ACCEPTED, response_model=TaskStatusResponse)
 async def start_scrape(
@@ -171,14 +220,43 @@ async def scrape_history(
     )
 
 
-@router.get("/analyze-only", response_model=TaskStatusResponse)
-async def analyze_only_stub(
+class AnalyzeRequest(BaseModel):
+    url: HttpUrl
+
+
+class AnalyzeResponse(BaseModel):
+    task_id: str
+    status: str
+    message: str
+
+
+@router.post("/analyze-only", response_model=AnalyzeResponse, status_code=status.HTTP_202_ACCEPTED)
+async def analyze_only(
+    body: AnalyzeRequest,
     user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
-    """Stub for Phase 3 AI analysis endpoint — returns placeholder until Week 3."""
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="AI analysis will be available in Week 3.",
+    """
+    AI analysis only — renders the page, runs LLM analysis, returns structured JSON.
+    Does not scrape. Useful to preview what the AI will extract before committing credits.
+    """
+    task = Task(
+        id=uuid.uuid4(),
+        user_id=user.id,
+        url=str(body.url),
+        status="pending",
+        custom_fields={"mode": "analyze_only"},
+    )
+    db.add(task)
+    await db.commit()
+    await db.refresh(task)
+
+    analyze_task.delay(str(task.id))
+
+    return AnalyzeResponse(
+        task_id=str(task.id),
+        status="pending",
+        message="Analysis enqueued. Poll GET /api/scrape/{task_id} for results.",
     )
 
 
