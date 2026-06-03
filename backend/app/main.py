@@ -3,6 +3,8 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.scrape_router import router as scrape_router
+from app.api.scraper_router import router as scraper_router
 from app.api.tasks_router import router as tasks_router
 from app.auth.router import router as auth_router
 from app.config import settings
@@ -23,6 +25,8 @@ app.add_middleware(
 
 app.include_router(auth_router)
 app.include_router(tasks_router)
+app.include_router(scraper_router)
+app.include_router(scrape_router)
 
 
 @app.get("/health")
