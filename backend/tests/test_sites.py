@@ -213,7 +213,7 @@ async def run_site(session, token: str, site: dict) -> SiteResult:
         has_expected = all(
             any(e in f for f in result.fields_found)
             for e in expected
-        ) if expected else True
+        ) if (expected and result.fields_found) else True
 
         if data.get("status") == "failed":
             result.status = "fail"

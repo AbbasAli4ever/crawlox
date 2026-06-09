@@ -132,6 +132,9 @@ def ai_scrape_task(self, task_id: str) -> dict:
             task.started_at = datetime.now(timezone.utc)
             await db.commit()
 
+        from app.ws.worker_events import emit_status, emit_captcha_required, emit_completed, emit_failed
+        await emit_status(task_id, "analyzing")
+
         try:
             # Step 1: load cookies
             async with AsyncSessionLocal() as db:
@@ -165,6 +168,7 @@ def ai_scrape_task(self, task_id: str) -> dict:
                 }
                 task.status = "scraping"
                 await db.commit()
+            await emit_status(task_id, "scraping")
 
             # Step 4: generate script (stored for reference, not sandbox-executed)
             try:
@@ -179,7 +183,8 @@ def ai_scrape_task(self, task_id: str) -> dict:
 
             # Step 5: execute using our runner pipeline driven by the analysis
             from app.scraper.runner import run_scrape
-            from dataclasses import asdict
+            from app.captcha.solver import get_solver
+            from app.captcha.handler import handle_captcha, log_captcha_metric
 
             selector_config = {
                 "container_selector": analysis.data_structure.container_selector,
@@ -189,6 +194,61 @@ def ai_scrape_task(self, task_id: str) -> dict:
                     for f in analysis.data_structure.fields
                 ],
             }
+
+            # Determine user tier and pick solver (premium+2captcha or manual)
+            async with AsyncSessionLocal() as db:
+                from app.db.models import User as UserModel
+                user_result = await db.execute(
+                    select(UserModel).where(UserModel.id == user_id)
+                )
+                user_obj = user_result.scalar_one_or_none()
+                user_tier = user_obj.subscription_tier if user_obj else "free"
+
+            solver = get_solver(user_tier, settings.captcha_solver)
+
+            # Inline CAPTCHA handler — runs inside the live browser session so the
+            # injected token applies to the real page. Returns True to resume scraping.
+            async def _captcha_handler(page, captcha_ctx) -> bool:
+                # Transition to captcha_needed + push to WebSocket
+                async with AsyncSessionLocal() as db:
+                    res = await db.execute(select(Task).where(Task.id == uuid.UUID(task_id)))
+                    t = res.scalar_one_or_none()
+                    if t:
+                        t.status = "captcha_needed"
+                        t.captcha_type = captcha_ctx.captcha_type
+                        await db.commit()
+                await emit_status(task_id, "captcha_needed")
+                await emit_captcha_required(task_id, {
+                    "task_id": task_id,
+                    "captcha_type": captcha_ctx.captcha_type,
+                    "sitekey": captcha_ctx.sitekey,
+                    "page_url": captcha_ctx.page_url,
+                    "screenshot_b64": captcha_ctx.screenshot_b64,
+                })
+
+                # handle_captcha: waits for solution, injects token, submits form
+                solved = await handle_captcha(page, captcha_ctx, solver, task_id, user_id)
+
+                solved_by = (
+                    "2captcha"
+                    if user_tier == "premium" and settings.captcha_solver == "twocaptcha"
+                    else "manual"
+                )
+                await log_captcha_metric(
+                    task_id, user_id, captcha_ctx.captcha_type,
+                    solved_by=solved_by, success=solved,
+                )
+
+                if solved:
+                    # Resume scraping
+                    async with AsyncSessionLocal() as db:
+                        res = await db.execute(select(Task).where(Task.id == uuid.UUID(task_id)))
+                        t = res.scalar_one_or_none()
+                        if t:
+                            t.status = "scraping"
+                            await db.commit()
+                    await emit_status(task_id, "scraping")
+                return solved
 
             scrape_result = await run_scrape(
                 url=url,
@@ -201,6 +261,9 @@ def ai_scrape_task(self, task_id: str) -> dict:
                 max_items=max_items,
                 timeout_seconds=custom_fields.get("timeout_seconds", 300),
                 cookies=cookies or None,
+                task_id=task_id,
+                check_captcha=True,
+                captcha_handler=_captcha_handler,
             )
 
             items = scrape_result.get("items", [])
@@ -225,6 +288,7 @@ def ai_scrape_task(self, task_id: str) -> dict:
                 task.total_items_scraped = len(items)
                 await db.commit()
 
+            await emit_completed(task_id, len(items))
             return {
                 "task_id": task_id,
                 "status": "completed",
@@ -243,15 +307,25 @@ def ai_scrape_task(self, task_id: str) -> dict:
                     await db.commit()
 
         except Exception as exc:
+            from app.scraper.runner import CaptchaDetectedError
+            # CAPTCHA is handled inline by _captcha_handler. Reaching here with a
+            # CaptchaDetectedError means the solve failed/timed out — mark as failed.
+            if isinstance(exc, CaptchaDetectedError):
+                error_msg = f"CAPTCHA ({exc.captcha_type}) was not solved in time"
+            else:
+                error_msg = str(exc)
+
             async with AsyncSessionLocal() as db:
                 result = await db.execute(select(Task).where(Task.id == uuid.UUID(task_id)))
                 task = result.scalar_one_or_none()
                 if task:
                     task.status = "failed"
                     task.completed_at = datetime.now(timezone.utc)
-                    task.scraped_data = {"error": str(exc)}
+                    task.scraped_data = {"error": error_msg}
                     await db.commit()
-            raise
+            await emit_failed(task_id, error_msg)
+            if not isinstance(exc, CaptchaDetectedError):
+                raise
 
     return asyncio.run(_run())
 

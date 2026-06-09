@@ -9,6 +9,8 @@ from app.api.tasks_router import router as tasks_router
 from app.auth.router import router as auth_router
 from app.config import settings
 from app.core.middleware import RequestIDMiddleware
+from app.ws.redis_relay import start_relay
+from app.ws.router import router as ws_router
 
 logging.basicConfig(level=settings.log_level.upper())
 
@@ -27,6 +29,10 @@ app.include_router(auth_router)
 app.include_router(tasks_router)
 app.include_router(scraper_router)
 app.include_router(scrape_router)
+app.include_router(ws_router)
+
+# Start Redis → WebSocket relay on startup
+start_relay(app)
 
 
 @app.get("/health")

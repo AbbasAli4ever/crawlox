@@ -37,6 +37,17 @@ def _build_schema(config: dict) -> ContainerSchema:
     )
 
 
+class CaptchaDetectedError(Exception):
+    """Raised when a CAPTCHA is detected mid-scrape. Caller should pause and handle."""
+    def __init__(self, task_id: str, captcha_type: str, sitekey: str | None, page_url: str, screenshot_b64: str | None):
+        self.task_id = task_id
+        self.captcha_type = captcha_type
+        self.sitekey = sitekey
+        self.page_url = page_url
+        self.screenshot_b64 = screenshot_b64
+        super().__init__(f"CAPTCHA detected: {captcha_type} at {page_url}")
+
+
 async def run_scrape(
     url: str,
     selector_config: dict,
@@ -45,6 +56,9 @@ async def run_scrape(
     max_items: int = 500,
     timeout_seconds: int = 300,
     cookies: list | None = None,
+    task_id: str | None = None,
+    check_captcha: bool = True,
+    captcha_handler=None,
 ) -> dict:
     """
     Full scrape pipeline:
@@ -53,7 +67,15 @@ async def run_scrape(
       3. Extract items page by page (pagination-aware)
       4. Return results + metadata
 
-    Raises asyncio.TimeoutError if timeout_seconds exceeded.
+    CAPTCHA handling:
+      - If captcha_handler is provided, it is awaited inline when a CAPTCHA is
+        detected (keeping the browser alive). Signature:
+          async def captcha_handler(page, captcha_ctx) -> bool  # True = solved, continue
+        The CAPTCHA wait time is excluded from timeout_seconds (the human/2captcha
+        may take minutes). If the handler returns False or is absent, raises
+        CaptchaDetectedError.
+
+    Raises asyncio.TimeoutError if timeout_seconds exceeded (excluding CAPTCHA waits).
     """
     schema = _build_schema(selector_config)
     pg_cfg = pagination_config or {}
@@ -61,6 +83,20 @@ async def run_scrape(
     final_cookies: list[dict] = []
     final_user_agent: str | None = None
     started_at = datetime.now(timezone.utc)
+
+    async def _handle_or_raise(page, captcha_ctx):
+        """Call the inline handler if present, else raise CaptchaDetectedError."""
+        if captcha_handler is not None:
+            solved = await captcha_handler(page, captcha_ctx)
+            if solved:
+                return  # CAPTCHA solved, continue scraping with same browser
+        raise CaptchaDetectedError(
+            task_id=task_id or "unknown",
+            captcha_type=captcha_ctx.captcha_type,
+            sitekey=captcha_ctx.sitekey,
+            page_url=captcha_ctx.page_url,
+            screenshot_b64=captcha_ctx.screenshot_b64,
+        )
 
     async def _scrape():
         nonlocal final_cookies, final_user_agent
@@ -74,6 +110,13 @@ async def run_scrape(
 
                 await with_retry(_goto, max_attempts=3, base_delay=2.0)
                 await random_delay(1.0, 2.0)
+
+                # Check for CAPTCHA after initial page load
+                if check_captcha:
+                    from app.captcha.detector import detect_and_capture
+                    captcha_ctx = await detect_and_capture(page)
+                    if captcha_ctx.detected:
+                        await _handle_or_raise(page, captcha_ctx)
 
                 # Choose paginator
                 if pagination_type == "url_params":
@@ -114,6 +157,13 @@ async def run_scrape(
                     paginator = no_pagination(page)
 
                 async for _ in paginator:
+                    # Check for CAPTCHA on each paginated page
+                    if check_captcha:
+                        from app.captcha.detector import detect_and_capture
+                        captcha_ctx = await detect_and_capture(page)
+                        if captcha_ctx.detected:
+                            await _handle_or_raise(page, captcha_ctx)
+
                     items = await extract_page(page, schema, base_url=page.url)
                     all_items.extend(items)
                     # deduplicate by converting to frozenset of items
@@ -136,7 +186,11 @@ async def run_scrape(
                 final_cookies = await page.context.cookies()
                 final_user_agent = await page.evaluate("navigator.userAgent")
 
-    await asyncio.wait_for(_scrape(), timeout=timeout_seconds)
+    # When a CAPTCHA handler is active, the human/2captcha may take up to ~5 min
+    # to solve. Extend the wall-clock timeout so the solve window isn't counted
+    # against the scrape budget. The handler enforces its own 300s solve timeout.
+    effective_timeout = timeout_seconds + (300 if captcha_handler is not None else 0)
+    await asyncio.wait_for(_scrape(), timeout=effective_timeout)
 
     completed_at = datetime.now(timezone.utc)
     duration = (completed_at - started_at).total_seconds()
