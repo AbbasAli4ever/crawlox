@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.scrape_router import router as scrape_router
 from app.api.scraper_router import router as scraper_router
+from app.api.subscription_router import router as subscription_router
 from app.api.tasks_router import router as tasks_router
 from app.auth.router import router as auth_router
 from app.config import settings
@@ -29,7 +30,13 @@ app.include_router(auth_router)
 app.include_router(tasks_router)
 app.include_router(scraper_router)
 app.include_router(scrape_router)
+app.include_router(subscription_router)
 app.include_router(ws_router)
+
+# Dev-only billing simulation endpoints — never mounted in stripe/prod mode
+if settings.billing_provider == "noop":
+    from app.api.dev_router import router as dev_router
+    app.include_router(dev_router)
 
 # Start Redis → WebSocket relay on startup
 start_relay(app)

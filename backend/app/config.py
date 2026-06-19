@@ -14,14 +14,17 @@ class Settings(BaseSettings):
     groq_api_key: str = ""
     gemini_api_key: str = ""
 
-    billing_provider: str = "noop"
+    billing_provider: str = "noop"  # noop | stripe
     stripe_secret_key: str = ""
     stripe_webhook_secret: str = ""
+    stripe_price_monthly: str = ""  # Stripe price ID for $29/mo plan
+    stripe_price_annual: str = ""   # Stripe price ID for $290/yr plan
 
     captcha_solver: str = "manual_only"
     twocaptcha_api_key: str = ""
 
     cors_allow_origins: str = "http://localhost:3000"
+    frontend_url: str = "http://localhost:3000"  # for checkout success/cancel redirects
     log_level: str = "INFO"
 
 

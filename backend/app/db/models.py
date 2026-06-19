@@ -35,6 +35,7 @@ class User(Base):
         String(20), nullable=False, default="free"
     )  # free | premium
     stripe_customer_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    stripe_subscription_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     monthly_credits_allocated: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
     credits_used_this_month: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_reset_date: Mapped[datetime] = mapped_column(
